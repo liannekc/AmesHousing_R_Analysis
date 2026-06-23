@@ -1,0 +1,195 @@
+---
+title: "Ames Housing Analysis"
+format: pdf
+editor: visual
+---
+
+## Ames Housing Analysis
+
+The following utilizes R to analyze the Ames Housing dataset to create a model predicting house sale price
+
+**Load Library and Inspect Data**
+
+We see that there are 74 predictors. With this many predictors, a standard Linear Regression may overfit and multicollinearity may occur. Regularized Regression will be used instead of account for this.
+
+The Sale Price is also skewed right, most likely due to very expensive houses in the dataset. This data will need to be normalized.
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(modeldata)
+
+# Load the built-in Ames housing dataset
+data("ames")
+
+# Check dataset size
+glimpse(ames)
+
+# Preview target distribution
+ggplot(ames, aes(x = Sale_Price)) +
+  geom_histogram(bins = 50, fill = "midnightblue", color = "white") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  labs(title = "Distribution of Ames House Sale Prices",
+       x = "Sale Price", y = "Count")
+
+```
+
+**Data splitting and Resampling**
+
+I split the data into 80/20 train/test. Because the pricing is skewed right (with some really expensive homes in the dataset), we will stratify by sale price to prevent to ensure that a disproportionate number of those high end homes don't end up entirely in the test or train set.
+
+```{r}
+set.seed(123)
+
+# Split into Training (80%) and Testing (20%) sets
+ames_split <- initial_split(ames, prop = 0.80, strata = Sale_Price)
+train_data <- training(ames_split)
+test_data  <- testing(ames_split)
+
+# Create Cross-Validation folds from the training data to evaluate models safely
+ames_folds <- vfold_cv(train_data, v = 5, strata = Sale_Price)
+```
+
+**Feature Engineering**
+
+Use recipes to clean and transform the data
+
+```{r}
+ames_recipe <- recipe(Sale_Price ~ ., data = train_data) %>%
+  #Log-transform the target variable to satisfy linearity assumptions
+  step_log(Sale_Price, base = 10) %>%
+  
+  #Pool rare categorical values (neighborhoods with <5% frequency get grouped into "Other")
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  
+  #Create dummy variables for all categorical columns
+  step_dummy(all_nominal_predictors()) %>%
+  
+  #Remove columns with near-zero variance
+  step_zv(all_predictors()) %>%
+  
+  #Center and scale all numeric predictors
+  step_normalize(all_numeric_predictors())
+```
+
+**Model Specifications and Workflows**
+
+Define the exact mathematical framework of the algorithm and creating a structural container to hold the entire pipeline.
+
+```{r}
+# Define the regularized model specification
+elnet_spec <- linear_reg(
+  penalty = tune(), 
+  mixture = tune()
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+# Bundle the recipe and model into a pipeline workflow
+elnet_workflow <- workflow() %>%
+  add_recipe(ames_recipe) %>% #passes data through recipe defined in previous step
+  add_model(elnet_spec) # takes the cleaned data and feeds it into the regularized regression model
+```
+
+**Hyperparameter Grid Definition and Model Fitting**
+
+```{r}
+# Create a custom grid to evaluate Lasso, Ridge, and a 50/50 mix across various penalty strengths
+custom_grid <- expand.grid(
+  penalty = c(0.001, 0.01, 0.1),
+  mixture = c(0, 0.5, 1)
+)
+
+# Fit the models across all 5 cross-validation folds for every combination in the grid
+
+tune_results <- tune_grid(
+  elnet_workflow,
+  resamples = ames_folds,
+  grid = custom_grid,
+  metrics = metric_set(rmse, rsq)
+)
+```
+
+**Compare Model Performance**
+
+Looks like Lasso is the best performing model (mixture = 1).
+
+Lasso's victory proves that the Ames housing dataset suffers from heavy feature redundancy and noise. By completely dropping unhelpful and collinear features to zero, Lasso simplified the network, lowered the model's variance, and generalized better to unseen testing data than Ridge could.
+
+```{r}
+# View performance of all combinations sorted by lowest RMSE
+show_best(tune_results, metric = "rmse")
+
+# Automatically isolate the single best performing model setup
+best_model_params <- select_best(tune_results, metric = "rmse")
+print(best_model_params)
+```
+
+**Final Fit and Test Set Evaluation**
+
+The R2 value is around 0.88, meaning the model successfully explains 88% of the variance in Ames housing prices. Only 12% of the variance is driven by unmeasured factors.
+
+The RMSE value is 0.06,
+
+```{r}
+# Finalize the workflow
+final_workflow <- finalize_workflow(elnet_workflow, best_model_params)
+
+# Execute the final fit on the train/test split
+final_fit <- last_fit(final_workflow, split = ames_split)
+
+# Output the metrics on test dataset
+print(collect_metrics(final_fit))
+
+# Plot Predicted vs. Actual values to visually assess performance
+collect_predictions(final_fit) %>%
+  ggplot(aes(x = .pred, y = Sale_Price)) +
+  geom_point(alpha = 0.4, color = "midnightblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Actual vs. Predicted House Prices",
+    x = "Predicted Sale Price (Log10)",
+    y = "Actual Sale Price (Log10)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Extract RMSE
+test_rmse <- final_fit %>% 
+  collect_metrics() %>% 
+  filter(.metric == "rmse") %>% 
+  pull(.estimate)
+
+# Extract R-squared
+test_rsq <- final_fit %>% 
+  collect_metrics() %>% 
+  filter(.metric == "rsq") %>% 
+  pull(.estimate)
+
+cat("RMSE:", round(test_rmse, 4), "\n")
+cat("R2:  ", round(test_rsq, 4), "\n")
+```
+
+```{r}
+pct_error <- (10^test_rmse - 1) * 100
+
+cat("On average, the model's predictions are within +/-", round(pct_error, 1), "% of the actual home value.")
+```
+
+```{r}
+# Extract the trained model engine and tidy the coefficients
+model_coefficients <- final_fit %>% 
+  extract_fit_parsnip() %>% 
+  tidy()
+
+# Filter out the intercept and any features that Lasso zeroed out
+active_features <- model_coefficients %>%
+  filter(term != "(Intercept)", estimate != 0) %>%
+  arrange(desc(abs(estimate)))
+
+# Print the top 10 most influential features
+print(head(active_features, 10))
+```
+
+GR_Liv_Area (Above-ground square footage) the largest positive coefficients, meaning physical size and is a dominant levers for property valuation in this market.
